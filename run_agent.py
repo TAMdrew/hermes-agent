@@ -6440,6 +6440,12 @@ class AIAgent:
                             invalidate_runtime_client(region)
                         raise
                     result["response"] = normalize_converse_response(raw_response)
+                elif self.api_mode == "vertex_genai":
+                    _vt_client = self._get_transport().client
+                    vt_model = api_kwargs.pop("model")
+                    vt_contents = api_kwargs.pop("contents")
+                    vt_config = api_kwargs.pop("config")
+                    result["response"] = _vt_client.models.generate_content(model=vt_model, contents=vt_contents, config=vt_config)
                 else:
                     request_client_holder["client"] = self._create_request_openai_client(
                         reason="chat_completion_request",
@@ -7618,6 +7624,8 @@ class AIAgent:
                 and base_url_host_matches(fb_base_url, "amazonaws.com")
             ):
                 fb_api_mode = "bedrock_converse"
+            elif fb_provider in ("vertex", "vertex-ai") or fb_base_url.rstrip("/").lower().endswith("aiplatform.googleapis.com"):
+                fb_api_mode = "vertex_genai"
 
             old_model = self.model
             self.model = fb_model

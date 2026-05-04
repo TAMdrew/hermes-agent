@@ -36,6 +36,7 @@ dependencies = [
   "edge-tts>=7.2.7,<8",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
   "PyJWT[crypto]>=2.12.0,<3",  # CVE-2026-32597
+  "google-genai>=1.73.1",
 ]
 
 [project.optional-dependencies]
@@ -65,7 +66,8 @@ mcp = ["mcp>=1.2.0,<2"]
 homeassistant = ["aiohttp>=3.9.0,<4"]
 sms = ["aiohttp>=3.9.0,<4"]
 acp = ["agent-client-protocol>=0.9.0,<1.0"]
-mistral = ["mistralai>=2.3.0,<3"]
+mistral = ["mistralai>=2.3.0,<3",
+  ]
 bedrock = ["boto3>=1.35.0,<2"]
 termux = [
   # Tested Android / Termux path: keeps the core CLI feature-rich while
@@ -148,7 +150,7 @@ testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
 ]
-addopts = "-m 'not integration' -n auto"
+addopts = "-m 'not integration'"
 
 [tool.ty.environment]
 python-version = "3.13"
