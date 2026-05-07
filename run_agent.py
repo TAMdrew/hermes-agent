@@ -5798,15 +5798,42 @@ class AIAgent:
                 self._client_log_context(),
             )
             return client
-        if self.provider == "gemini":
-            from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
-
-            base_url = str(client_kwargs.get("base_url", "") or "")
+        # Gemini native client gate — fires on EITHER:
+        # (a) provider == "gemini" (canonical built-in provider), or
+        # (b) the base_url is a recognized Gemini-native endpoint (GenLang or
+        #     Vertex AI publishers/google), regardless of the user-defined
+        #     provider name (e.g. "vertex-gemini-pro-customtools").
+        # Without (b), user providers pointing at Vertex Gemini fall through
+        # to the OpenAI SDK which appends /chat/completions and 404s.
+        from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+        _gemini_base = str(client_kwargs.get("base_url", "") or "")
+        if self.provider == "gemini" or is_native_gemini_base_url(_gemini_base):
+            base_url = _gemini_base
             if is_native_gemini_base_url(base_url):
-                safe_kwargs = {
-                    k: v for k, v in client_kwargs.items()
-                    if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
-                }
+                # Filter to keys GeminiNativeClient accepts AND drop OpenAI SDK
+                # sentinels (openai.Omit) that httpx rejects with
+                # "Header value must be str or bytes". OpenAI's client populates
+                # default_headers with `Omit` placeholders that the OpenAI SDK
+                # interprets as "skip", but Gemini's plain httpx client doesn't
+                # know that convention.
+                _ALLOWED_GEMINI_KEYS = {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+                safe_kwargs = {}
+                for k, v in client_kwargs.items():
+                    if k not in _ALLOWED_GEMINI_KEYS:
+                        continue
+                    # Drop openai.Omit and similar sentinel objects
+                    if v is None:
+                        continue
+                    type_name = type(v).__name__
+                    if type_name == "Omit" or type_name == "NotGiven":
+                        continue
+                    safe_kwargs[k] = v
+                # Sanitize default_headers — drop any non-str/bytes values
+                if isinstance(safe_kwargs.get("default_headers"), dict):
+                    safe_kwargs["default_headers"] = {
+                        hk: hv for hk, hv in safe_kwargs["default_headers"].items()
+                        if isinstance(hv, (str, bytes))
+                    }
                 if "http_client" not in safe_kwargs:
                     keepalive_http = self._build_keepalive_http_client(base_url)
                     if keepalive_http is not None:

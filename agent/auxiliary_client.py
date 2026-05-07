@@ -2233,7 +2233,12 @@ def resolve_provider_client(
                         api_key_str: str = ""):
         """Wrap a plain OpenAI client in the correct transport adapter.
 
-        Handles two cases:
+        Handles three cases:
+        - ``GeminiNativeClient`` when the endpoint is a native Gemini surface
+          (GenLang or Vertex AI publishers/google). Without this, OpenAI SDK
+          appends ``/chat/completions`` to URLs ending in ``:generateContent``
+          → 404. Vertex Gemini also requires GCE Bearer auth (handled inside
+          GeminiNativeClient).
         - ``CodexAuxiliaryClient`` when the endpoint needs the Responses API
           (explicit ``api_mode=codex_responses`` or api.openai.com + codex
           model name).
@@ -2243,6 +2248,26 @@ def resolve_provider_client(
 
         Clients that are already specialized wrappers pass through unchanged.
         """
+        # Gemini-native gate FIRST — must precede OpenAI/Anthropic/Codex wrap
+        # checks because Vertex Gemini URLs match no other special-case but
+        # ALWAYS need the native client (URL shape + Vertex Bearer auth).
+        try:
+            from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+            if (
+                not _safe_isinstance(client_obj, GeminiNativeClient)
+                and is_native_gemini_base_url(base_url_str)
+            ):
+                logger.debug(
+                    "resolve_provider_client: rewrapping plain OpenAI client in "
+                    "GeminiNativeClient (model=%s, base_url=%s)",
+                    final_model_str, base_url_str[:80] if base_url_str else "")
+                # Build a fresh GeminiNativeClient — discards the OpenAI SDK
+                # wrapper. api_key is a placeholder on Vertex (real auth is
+                # GCE Bearer, fetched inside the native client).
+                return GeminiNativeClient(api_key=api_key_str, base_url=base_url_str)
+        except ImportError:
+            pass
+
         if _needs_codex_wrap(client_obj, base_url_str, final_model_str):
             logger.debug(
                 "resolve_provider_client: wrapping client in CodexAuxiliaryClient "
@@ -2936,7 +2961,7 @@ def resolve_vision_provider_client(
 
 def get_auxiliary_extra_body() -> dict:
     """Return extra_body kwargs for auxiliary API calls.
-    
+
     Includes Nous Portal product tags when the auxiliary client is backed
     by Nous Portal. Returns empty dict otherwise.
     """
@@ -2945,7 +2970,7 @@ def get_auxiliary_extra_body() -> dict:
 
 def auxiliary_max_tokens_param(value: int) -> dict:
     """Return the correct max tokens kwarg for the auxiliary client's provider.
-    
+
     OpenRouter and local models use 'max_tokens'. Direct OpenAI with newer
     models (gpt-4o, o-series, gpt-5+) requires 'max_completion_tokens'.
     The Codex adapter translates max_tokens internally, so we use max_tokens

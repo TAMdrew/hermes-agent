@@ -35,13 +35,88 @@ DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def is_native_gemini_base_url(base_url: str) -> bool:
-    """Return True when the endpoint speaks Gemini's native REST API."""
+    """Return True when the endpoint speaks Gemini's native REST API.
+
+    Recognises both:
+    - GenLang (``generativelanguage.googleapis.com``) — uses API key auth
+    - Vertex AI (``aiplatform.googleapis.com/.../publishers/google``) — uses
+      GCE OAuth Bearer tokens (handled in ``GeminiNativeClient._headers``)
+    """
     normalized = str(base_url or "").strip().rstrip("/").lower()
     if not normalized:
         return False
-    if "generativelanguage.googleapis.com" not in normalized:
-        return False
-    return not normalized.endswith("/openai")
+    if "generativelanguage.googleapis.com" in normalized:
+        return not normalized.endswith("/openai")
+    # Vertex AI publisher endpoints for Google models speak the same
+    # ``models/{model}:generateContent`` schema as GenLang. Auth is the
+    # only difference (Bearer vs API key) — handled in _headers().
+    if "aiplatform.googleapis.com" in normalized and "publishers/google" in normalized:
+        # Reject the OpenAI-compat surface (``endpoints/openapi/chat/completions``)
+        # — that one needs the OpenAI SDK, not this native adapter.
+        if "endpoints/openapi" in normalized:
+            return False
+        return True
+    return False
+
+
+def is_vertex_gemini_base_url(base_url: str) -> bool:
+    """Return True when ``base_url`` is a Vertex AI Gemini publisher endpoint
+    that needs GCE Bearer auth instead of an API key."""
+    normalized = str(base_url or "").strip().lower()
+    return (
+        "aiplatform.googleapis.com" in normalized
+        and "publishers/google" in normalized
+        and "endpoints/openapi" not in normalized
+    )
+
+
+def _strip_vertex_model_suffix(base_url: str) -> str:
+    """Vertex base URLs in config commonly include the full
+    ``.../models/<model>:generateContent`` path. Strip that so the adapter
+    can append ``/models/{model}:generateContent`` itself per request,
+    keeping URL construction symmetric with GenLang.
+
+    Idempotent — safe to call on already-bare URLs.
+    """
+    url = str(base_url or "").rstrip("/")
+    # Strip trailing ``:generateContent`` / ``:streamGenerateContent`` / ``:rawPredict`` / etc.
+    if ":" in url.rsplit("/", 1)[-1]:
+        url = url.rsplit(":", 1)[0]
+    # Strip ``/models/<model>`` if present.
+    if "/models/" in url:
+        url = url.split("/models/")[0]
+    return url
+
+
+_VERTEX_GCE_TOKEN_CACHE: Dict[str, Any] = {"token": None, "expires_at": 0.0}
+
+
+def _fetch_gce_metadata_token(timeout: float = 5.0) -> Optional[str]:
+    """Fetch (and cache) a GCE service-account access token from the metadata
+    server. Returns None if not on GCE or the request fails. Tokens are
+    cached for 50 minutes (real expiry is 60 min)."""
+    import time
+    cached = _VERTEX_GCE_TOKEN_CACHE
+    if cached["token"] and time.time() < cached["expires_at"]:
+        return cached["token"]
+    try:
+        with httpx.Client(trust_env=False) as c:
+            resp = c.get(
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                headers={"Metadata-Flavor": "Google"},
+                timeout=timeout,
+            )
+            data = resp.json()
+            token = data.get("access_token")
+            if token:
+                # Refresh slightly early — GCE tokens last ~3600s.
+                expires_in = float(data.get("expires_in", 3600))
+                cached["token"] = token
+                cached["expires_at"] = time.time() + max(60.0, expires_in - 600.0)
+                return token
+    except Exception:
+        return None
+    return None
 
 
 def probe_gemini_tier(
@@ -376,12 +451,16 @@ def _normalize_thinking_config(config: Any) -> Optional[Dict[str, Any]]:
     include = config.get("includeThoughts", config.get("include_thoughts"))
     level = config.get("thinkingLevel", config.get("thinking_level"))
     normalized: Dict[str, Any] = {}
-    if isinstance(budget, (int, float)):
-        normalized["thinkingBudget"] = int(budget)
+
     if isinstance(include, bool):
         normalized["includeThoughts"] = include
-    if isinstance(level, str) and level.strip():
+
+    # API Conflict: Can only set ONE of budget or level. Prioritize budget.
+    if isinstance(budget, (int, float)):
+        normalized["thinkingBudget"] = int(budget)
+    elif isinstance(level, str) and level.strip():
         normalized["thinkingLevel"] = level.strip().lower()
+
     return normalized or None
 
 
@@ -402,6 +481,15 @@ def build_gemini_request(
         request["systemInstruction"] = system_instruction
 
     gemini_tools = _translate_tools_to_gemini(tools)
+
+    # Enable native Google Search grounding if requested in thinking_config
+    if isinstance(thinking_config, dict) and (thinking_config.get("google_search") or thinking_config.get("grounding")):
+        if not gemini_tools:
+            gemini_tools = []
+        # Check if google_search is already there to avoid duplicates
+        if not any("googleSearch" in t or "google_search" in t for t in gemini_tools):
+            gemini_tools.append({"googleSearch": {}})
+
     if gemini_tools:
         request["tools"] = gemini_tools
 
@@ -826,7 +914,13 @@ class GeminiNativeClient:
         normalized_base = (base_url or DEFAULT_GEMINI_BASE_URL).rstrip("/")
         if normalized_base.endswith("/openai"):
             normalized_base = normalized_base[: -len("/openai")]
+        # Vertex base URLs in config commonly include the per-model suffix
+        # (``.../models/<model>:generateContent``). Strip it so request URLs
+        # are constructed symmetrically with GenLang.
+        if is_vertex_gemini_base_url(normalized_base):
+            normalized_base = _strip_vertex_model_suffix(normalized_base)
         self.base_url = normalized_base
+        self._is_vertex = is_vertex_gemini_base_url(self.base_url)
         self._default_headers = dict(default_headers or {})
         self.chat = _GeminiChatNamespace(self)
         self.is_closed = False
@@ -851,10 +945,36 @@ class GeminiNativeClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "x-goog-api-key": self.api_key,
             "User-Agent": "hermes-agent (gemini-native)",
         }
-        headers.update(self._default_headers)
+        if self._is_vertex:
+            # Vertex AI rejects API keys (HTTP 401 "API keys are not supported
+            # by this API"). Inject a GCE service-account Bearer token from
+            # the metadata server. Falls back to the API key only if metadata
+            # is unreachable (yields a clear 401 from Vertex with the auth
+            # message — better than a confusing 404 from URL fallthrough).
+            token = _fetch_gce_metadata_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            else:
+                headers["x-goog-api-key"] = self.api_key
+        else:
+            headers["x-goog-api-key"] = self.api_key
+        # Default headers may include OpenAI-SDK injected x-goog-api-key OR
+        # Authorization: Bearer <api_key> from the OpenAI Stainless SDK. On
+        # Vertex this would override the Authorization Bearer GCE token we
+        # just set and cause 401 (the SDK uses the Google API key as a Bearer
+        # token, but Vertex requires a real OAuth2 access token).
+        # Apply default_headers BUT strip both auth headers on Vertex.
+        if self._is_vertex:
+            for k, v in self._default_headers.items():
+                kl = k.lower()
+                # Skip api-key OR pre-injected Authorization on Vertex — our GCE Bearer wins
+                if kl == "x-goog-api-key" or kl == "authorization":
+                    continue
+                headers[k] = v
+        else:
+            headers.update(self._default_headers)
         return headers
 
     @staticmethod
